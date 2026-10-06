@@ -3,7 +3,9 @@ from ultralytics import YOLO
 
 model = YOLO("best.pt")
 
-image_path = r"C:\Users\231348700\Downloads\iStock-970105714_0.jpg"
+
+
+image_path = r"C:\Users\231348700\Downloads\jvc.jpeg"
 frame = cv2.imread(image_path)
 
 if frame is None:
@@ -11,7 +13,7 @@ if frame is None:
     exit()
 
 # FIX 1: Lower the confidence to 0.25 (25%) and turn verbose=True so the AI explains itself
-results = model.predict(source=frame, conf=0.25, verbose=True)
+results = model.predict(source=frame, conf=0.5, verbose=True)
 result = results[0] 
 
 boxes = result.boxes
