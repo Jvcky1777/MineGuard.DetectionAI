@@ -5,6 +5,7 @@ import threading
 from typing import Optional, List, Dict, Any
 
 import cv2
+import requests
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -98,6 +99,87 @@ def parse_yolo_result(result, original_w: int, original_h: int) -> Dict[str, Any
 # ==========================================
 # Native Camera Manager (OpenCV backend)
 # ==========================================
+# Roboflow Cloud Deployment Configuration
+ROBOFLOW_API_KEY = "tRVHHVVhltdOXqileCgJ"
+ROBOFLOW_PROJECT = "mineguard-detection-crele"
+ROBOFLOW_VERSION = "7"
+ROBOFLOW_FALLBACK_VERSION = "4"
+
+def parse_roboflow_predictions(predictions: List[Dict[str, Any]], img_w: int, img_h: int) -> Dict[str, Any]:
+    detections = []
+    violations_count = 0
+    compliant_count = 0
+
+    for i, pred in enumerate(predictions):
+        class_name = pred.get("class", "Unknown")
+        confidence = round(float(pred.get("confidence", 0.0)), 3)
+        cx, cy = pred.get("x", 0), pred.get("y", 0)
+        w, h = pred.get("width", 0), pred.get("height", 0)
+
+        x1 = max(0, int(cx - (w / 2)))
+        y1 = max(0, int(cy - (h / 2)))
+        x2 = min(img_w, int(cx + (w / 2)))
+        y2 = min(img_h, int(cy + (h / 2)))
+
+        violation = is_violation_class(class_name)
+        if violation:
+            violations_count += 1
+        else:
+            compliant_count += 1
+
+        detections.append({
+            "id": i,
+            "class_id": i,
+            "class_name": class_name,
+            "confidence": confidence,
+            "confidence_pct": int(confidence * 100),
+            "is_violation": violation,
+            "bbox": {
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+            },
+            "normalized_bbox": {
+                "x1": round(x1 / max(img_w, 1), 4),
+                "y1": round(y1 / max(img_h, 1), 4),
+                "x2": round(x2 / max(img_w, 1), 4),
+                "y2": round(y2 / max(img_h, 1), 4),
+            }
+        })
+
+    status = "NO_OBJECTS"
+    if violations_count > 0:
+        status = "VIOLATION"
+    elif compliant_count > 0:
+        status = "COMPLIANT"
+
+    return {
+        "timestamp": time.time(),
+        "status": status,
+        "counts": {
+            "total": len(detections),
+            "violations": violations_count,
+            "compliant": compliant_count
+        },
+        "detections": detections
+    }
+
+def annotate_roboflow_frame(frame, detections):
+    annotated = frame.copy()
+    for det in detections:
+        box = det["bbox"]
+        is_violation = det["is_violation"]
+        color = (0, 0, 255) if is_violation else (0, 255, 0)
+        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        label = f"{det['class_name']} {det['confidence_pct']}%"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(annotated, (x1, max(0, y1 - 22)), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(annotated, label, (x1 + 3, max(15, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return annotated
+
 class NativeCameraManager:
     def __init__(self):
         self.cap: Optional[cv2.VideoCapture] = None
@@ -313,6 +395,85 @@ async def detect_frame(
         "height": h
     }
 
+
+@app.post("/api/detect_roboflow")
+async def detect_roboflow(
+    file: UploadFile = File(...),
+    conf: float = Form(0.45),
+    return_annotated: bool = Form(True),
+    version: Optional[str] = Form("7")
+):
+    """
+    Accepts an uploaded frame, runs detection via the Roboflow Cloud Server API,
+    and returns telemetry + base64 annotated frame with bounding boxes.
+    """
+    t0 = time.time()
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return JSONResponse(status_code=400, content={"error": "Failed to decode image"})
+
+    h, w = frame.shape[:2]
+    image_base64 = base64.b64encode(contents).decode("utf-8")
+
+    selected_version = version or ROBOFLOW_VERSION
+    conf_pct = max(10, min(95, int(conf * 100)))
+    url = f"https://detect.roboflow.com/{ROBOFLOW_PROJECT}/{selected_version}?api_key={ROBOFLOW_API_KEY}&confidence={conf_pct}&overlap=50"
+
+    try:
+        response = requests.post(
+            url,
+            data=image_base64,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=12.0
+        )
+        if response.status_code != 200 and selected_version == "7":
+            # Fallback to version 4 if version 7 is still initializing on cloud
+            fallback_url = f"https://detect.roboflow.com/{ROBOFLOW_PROJECT}/{ROBOFLOW_FALLBACK_VERSION}?api_key={ROBOFLOW_API_KEY}&confidence={conf_pct}&overlap=50"
+            fb_resp = requests.post(
+                fallback_url,
+                data=image_base64,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=12.0
+            )
+            if fb_resp.status_code == 200:
+                response = fb_resp
+                selected_version = ROBOFLOW_FALLBACK_VERSION
+
+        if response.status_code != 200:
+            return JSONResponse(
+                status_code=response.status_code,
+                content={"error": f"Roboflow API error ({response.status_code}): {response.text}"}
+            )
+
+        res_json = response.json()
+        predictions = res_json.get("predictions", [])
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to connect to Roboflow server: {str(e)}"}
+        )
+
+    telemetry = parse_roboflow_predictions(predictions, w, h)
+    telemetry["inference_time_ms"] = round((time.time() - t0) * 1000, 1)
+    telemetry["model_engine"] = f"Roboflow Cloud ({ROBOFLOW_PROJECT}/{selected_version})"
+
+    annotated_base64 = None
+    if return_annotated:
+        annotated_frame = annotate_roboflow_frame(frame, telemetry["detections"])
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+        _, buffer = cv2.imencode('.jpg', annotated_frame, encode_param)
+        annotated_base64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
+
+    return {
+        "telemetry": telemetry,
+        "annotated_image": annotated_base64,
+        "width": w,
+        "height": h,
+        "model_version": selected_version
+    }
 
 # ==========================================
 # WebSocket for high-speed Browser Webcam Streaming

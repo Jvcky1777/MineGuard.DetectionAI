@@ -5,7 +5,9 @@ model = YOLO("best.pt")
 
 
 
-image_path = r"C:\Users\231348700\Downloads\jvc.jpeg"
+image_path = r"C:\Users\231348700\Downloads\new sample\dsfd.jpeg"
+
+
 frame = cv2.imread(image_path)
 
 if frame is None:

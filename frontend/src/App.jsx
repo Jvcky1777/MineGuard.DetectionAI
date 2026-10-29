@@ -15,7 +15,10 @@ import {
   VolumeX,
   Activity,
   HardHat,
-  Cpu
+  Cpu,
+  Cloud,
+  Upload,
+  Server
 } from 'lucide-react';
 import './App.css';
 
@@ -26,6 +29,9 @@ export default function App() {
   const [fps, setFps] = useState(0);
   const [confThreshold, setConfThreshold] = useState(0.45);
   const [soundEnabled, setSoundEnabled] = useState(false);
+  const [isServerTesting, setIsServerTesting] = useState(false);
+  const [testImageName, setTestImageName] = useState('');
+  const fileInputRef = useRef(null);
   const [telemetry, setTelemetry] = useState({
     status: 'STANDBY',
     counts: { total: 0, violations: 0, compliant: 0 },
@@ -216,7 +222,8 @@ export default function App() {
             formData.append('conf', confThreshold.toString());
             formData.append('return_annotated', 'true');
 
-            const res = await fetch('/api/detect_frame', {
+            const endpoint = cameraMode === 'server' ? '/api/detect_roboflow' : '/api/detect_frame';
+            const res = await fetch(endpoint, {
               method: 'POST',
               body: formData
             });
@@ -257,9 +264,10 @@ export default function App() {
           }
 
           if (isLoopRunning.current) {
+            const throttleMs = cameraMode === 'server' ? 220 : 60; // 220ms throttle for Roboflow Cloud to avoid rate limits
             setTimeout(() => {
               animationFrameId.current = requestAnimationFrame(processFrame);
-            }, 60); // ~15 FPS throttle for smooth inference
+            }, throttleMs);
           }
         }, 'image/jpeg', 0.85);
       } else {
@@ -270,6 +278,62 @@ export default function App() {
     };
 
     animationFrameId.current = requestAnimationFrame(processFrame);
+  };
+
+  // Single image test handler (runs against Roboflow Server or Local YOLO)
+  const handleImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsServerTesting(true);
+    setTestImageName(file.name);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('conf', confThreshold.toString());
+      formData.append('return_annotated', 'true');
+
+      const endpoint = cameraMode === 'server' ? '/api/detect_roboflow' : '/api/detect_frame';
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `Server returned error status ${res.status}`);
+      }
+
+      const data = await res.json();
+      if (data.telemetry) {
+        setTelemetry(data.telemetry);
+        if (data.telemetry.counts?.violations > 0) {
+          triggerAudioAlert();
+        }
+      }
+
+      // Draw the annotated image on canvas
+      if (data.annotated_image && canvasRef.current) {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = canvasRef.current;
+          if (canvas) {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+          }
+        };
+        img.src = data.annotated_image;
+      }
+    } catch (err) {
+      console.error('Image test error:', err);
+      alert(`Detection failed: ${err.message}`);
+    } finally {
+      setIsServerTesting(false);
+      if (e.target) e.target.value = '';
+    }
   };
 
   // Toggle Start / Stop
@@ -372,45 +436,51 @@ export default function App() {
               />
             )}
 
-            {/* Browser Webcam Canvas & Hidden Video */}
-            {cameraMode === 'browser' && (
+            {/* Browser Webcam / Server Canvas & Hidden Video */}
+            {(cameraMode === 'browser' || cameraMode === 'server') && (
               <>
                 <video ref={videoRef} playsInline muted style={{ display: 'none' }} />
                 <canvas
                   ref={canvasRef}
                   className="video-stream-canvas"
-                  style={{ display: isRunning ? 'block' : 'none' }}
+                  style={{ display: (isRunning || testImageName) ? 'block' : 'none' }}
                 />
               </>
             )}
 
             {/* Standby Placeholder */}
-            {!isRunning && (
+            {!isRunning && !testImageName && (
               <div className="standby-state">
                 <div className="standby-icon-circle">
-                  <VideoOff size={40} />
+                  {cameraMode === 'server' ? <Cloud size={40} color="#38bdf8" /> : <VideoOff size={40} />}
                 </div>
                 <div>
-                  <h3 className="standby-title">Live Detection Camera is Inactive</h3>
+                  <h3 className="standby-title">
+                    {cameraMode === 'server' ? 'Roboflow Server Detection Standby' : 'Live Detection Camera is Inactive'}
+                  </h3>
                   <p className="standby-desc">
-                    Click the <strong>Start Detection</strong> button below to activate the live camera feed and see real-time AI bounding boxes.
+                    {cameraMode === 'server'
+                      ? 'Click "Start Detection" to stream your webcam to the Roboflow Cloud model, or click "Test Image" to upload any photo directly to the server.'
+                      : 'Click the Start Detection button below to activate the live camera feed and see real-time AI bounding boxes.'}
                   </p>
                 </div>
               </div>
             )}
 
             {/* HUD Overlay Bar */}
-            {isRunning && (
+            {(isRunning || testImageName) && (
               <div className="hud-overlay">
                 <div className="hud-top-bar">
                   <div className={`hud-pill ${telemetry.counts.violations > 0 ? 'alert' : 'safe'}`}>
                     <span className="pulse-dot online" />
-                    <span>LIVE AI FEED • {cameraMode.toUpperCase()}</span>
+                    <span>
+                      {isRunning ? `LIVE • ${cameraMode === 'server' ? 'ROBOFLOW SERVER' : cameraMode.toUpperCase()}` : `IMAGE TEST • ${cameraMode === 'server' ? 'ROBOFLOW SERVER' : 'LOCAL MODEL'}`}
+                    </span>
                   </div>
 
                   <div className="hud-pill">
-                    <Cpu size={14} />
-                    <span>YOLOv8 PPE MODEL</span>
+                    {cameraMode === 'server' ? <Cloud size={14} color="#38bdf8" /> : <Cpu size={14} />}
+                    <span>{cameraMode === 'server' ? 'ROBOFLOW CLOUD (V7)' : 'LOCAL YOLOv8 (best.pt)'}</span>
                   </div>
                 </div>
 
@@ -452,11 +522,30 @@ export default function App() {
               <button
                 className="btn-secondary"
                 onClick={handleTakeSnapshot}
-                disabled={!isRunning}
+                disabled={!isRunning && !testImageName}
                 title="Capture snapshot with bounding boxes"
               >
                 <Camera size={16} />
                 <span>Capture Frame</span>
+              </button>
+
+              {/* Upload image to test on server or local */}
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={handleImageUpload}
+              />
+              <button
+                className="btn-secondary"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isRunning || isServerTesting}
+                title="Select an image file to test with the selected model (Roboflow or Local)"
+                style={{ borderColor: cameraMode === 'server' ? '#0284c7' : 'inherit' }}
+              >
+                <Upload size={16} color={cameraMode === 'server' ? '#38bdf8' : 'currentColor'} />
+                <span>{isServerTesting ? 'Testing Server...' : 'Test Image'}</span>
               </button>
             </div>
 
@@ -473,6 +562,14 @@ export default function App() {
                 onClick={() => handleModeSwitch('browser')}
               >
                 Browser Webcam
+              </button>
+              <button
+                className={`mode-option-btn ${cameraMode === 'server' ? 'active' : ''}`}
+                onClick={() => handleModeSwitch('server')}
+                title="Use Roboflow Cloud Server Model (mineguard-detection-crele/7)"
+              >
+                <Cloud size={13} style={{ marginRight: 5, verticalAlign: 'middle' }} />
+                Server Model (Roboflow)
               </button>
             </div>
           </div>
